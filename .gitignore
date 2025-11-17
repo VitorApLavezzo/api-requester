@@ -1,0 +1,9 @@
+# Ignorar arquivo .env
+.env
+
+*.pyc
+
+venv/
+
+response.json
+errors.json
