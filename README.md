@@ -30,6 +30,9 @@ A rotina inclui:
 O arquivo `.env` deve conter:
 
     URL=https://sua_api_aqui.com/endpoint
+    CLIENT_ID=
+    CLIENT_SECRET=
+    TOKEN_URL=
     ACCESS_TOKEN=seu_token_de_acesso
 
 A rotina valida:
