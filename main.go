@@ -23,8 +23,6 @@ const (
 	requestTimeout = 30 * time.Second
 )
 
-/* --------------------- RATE LIMIT STRUCTS --------------------- */
-
 type RateLimit struct {
 	URL       string
 	Value     int
@@ -36,7 +34,6 @@ type RateLimit struct {
 
 var rateLimits []*RateLimit
 
-/* -------------------------------------------------------------- */
 
 type ErrorResponse struct {
 	Attempt int    `json:"attempt"`
@@ -54,9 +51,7 @@ func main() {
 	responsePath := cwd + "/response.json"
 	errorLogPath := cwd + "/errors.json"
 
-	/* ----------- CARREGA RATE LIMIT DINÂMICO DO ENV ----------- */
 	loadRateLimitsFromEnv(envPath)
-	/* ----------------------------------------------------------- */
 
 	urlBase, tokenURL, token, err := loadEnvValues(envPath)
 	if err != nil || strings.TrimSpace(token) == "" {
@@ -176,7 +171,6 @@ func applyRateLimit(requestURL string) {
 	}
 }
 
-/* -------------------------------------------------------------- */
 
 func loadEnvValues(path string) (string, string, string, error) {
 	file, err := os.Open(path)
@@ -327,9 +321,7 @@ func doRequestWithRetry(url, token string, attempts int) ([]byte, []ErrorRespons
 
 	for attempt := 1; attempt <= attempts; attempt++ {
 
-		/* -------- APLICA RATE LIMIT AQUI -------- */
 		applyRateLimit(url)
-		/* ---------------------------------------- */
 
 		log.Printf("Tentativa %d de %d...", attempt, attempts)
 
@@ -350,9 +342,7 @@ func doRequestWithRetry(url, token string, attempts int) ([]byte, []ErrorRespons
 
 func doSingleRequest(client *http.Client, url, token string) ([]byte, int, error) {
 
-	/* -------- APLICA RATE LIMIT EM TODA REQUISIÇÃO -------- */
 	applyRateLimit(url)
-	/* ------------------------------------------------------- */
 
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
