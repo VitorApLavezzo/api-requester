@@ -13,13 +13,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"regexp"
 )
 
 const (
 	maxAttempts    = 5
 	requestTimeout = 30 * time.Second
 )
+
+/* --------------------- RATE LIMIT STRUCTS --------------------- */
+
+type RateLimit struct {
+	URL       string
+	Value     int
+	Type      string // "seconds" ou "minutes"
+	Count     int
+	ResetTime time.Time
+	mu        sync.Mutex
+}
+
+var rateLimits []*RateLimit
+
+/* -------------------------------------------------------------- */
 
 type ErrorResponse struct {
 	Attempt int    `json:"attempt"`
@@ -37,6 +54,10 @@ func main() {
 	responsePath := cwd + "/response.json"
 	errorLogPath := cwd + "/errors.json"
 
+	/* ----------- CARREGA RATE LIMIT DINÂMICO DO ENV ----------- */
+	loadRateLimitsFromEnv(envPath)
+	/* ----------------------------------------------------------- */
+
 	urlBase, tokenURL, token, err := loadEnvValues(envPath)
 	if err != nil || strings.TrimSpace(token) == "" {
 		log.Println("ACCESS_TOKEN ausente ou inválido. Gerando novo token...")
@@ -45,7 +66,6 @@ func main() {
 			log.Fatalf("Erro ao gerar token: %v", err)
 		}
 	}
-
 
 	urlRequest := buildURL(urlBase)
 	body, errors, err := doRequestWithRetry(urlRequest, token, maxAttempts)
@@ -63,6 +83,100 @@ func main() {
 	writeFile(responsePath, body)
 	log.Println("Arquivo response.json criado com sucesso.")
 }
+
+
+func loadRateLimitsFromEnv(envPath string) {
+	content, err := os.ReadFile(envPath)
+	if err != nil {
+		log.Fatalf("Erro ao abrir .env para rate limit: %v", err)
+	}
+
+	re := regexp.MustCompile(`(?m)^RATE_LIMIT_(\d+)_(URL|VALUE|TYPE)=(.+)$`)
+	matches := re.FindAllStringSubmatch(string(content), -1)
+
+	temp := make(map[string]map[string]string)
+
+	for _, m := range matches {
+		group := m[1]
+		field := m[2]
+		value := strings.TrimSpace(m[3])
+
+		if _, ok := temp[group]; !ok {
+			temp[group] = make(map[string]string)
+		}
+
+		temp[group][field] = value
+	}
+
+	for _, data := range temp {
+		if data["URL"] == "" || data["VALUE"] == "" || data["TYPE"] == "" {
+			continue
+		}
+
+		valueInt := 0
+		fmt.Sscanf(data["VALUE"], "%d", &valueInt)
+
+		rl := &RateLimit{
+			URL:       data["URL"],
+			Value:     valueInt,
+			Type:      strings.ToLower(data["TYPE"]),
+			ResetTime: time.Now(),
+		}
+
+        rateLimits = append(rateLimits, rl)
+	}
+
+	log.Println("Rate limits carregados:", len(rateLimits))
+}
+
+func applyRateLimit(requestURL string) {
+	for _, rl := range rateLimits {
+
+		if strings.HasPrefix(requestURL, rl.URL) {
+
+			rl.mu.Lock()
+
+			now := time.Now()
+
+			// RESET automático baseado no tipo
+			if rl.Type == "seconds" {
+				if now.After(rl.ResetTime.Add(1 * time.Second)) {
+					rl.Count = 0
+					rl.ResetTime = now
+				}
+			} else if rl.Type == "minutes" {
+				if now.After(rl.ResetTime.Add(1 * time.Minute)) {
+					rl.Count = 0
+					rl.ResetTime = now
+				}
+			}
+
+			if rl.Count >= rl.Value {
+				waitDuration := rl.ResetTime.Add(
+					map[string]time.Duration{
+						"seconds": 1 * time.Second,
+						"minutes": 1 * time.Minute,
+					}[rl.Type],
+				).Sub(now)
+
+				rl.mu.Unlock()
+
+				log.Printf("[RATE LIMIT] Aguardando %v para URL %s\n", waitDuration, requestURL)
+				time.Sleep(waitDuration)
+
+				applyRateLimit(requestURL)
+				return
+			}
+
+			rl.Count++
+			rl.mu.Unlock()
+
+			return
+		}
+	}
+}
+
+/* -------------------------------------------------------------- */
 
 func loadEnvValues(path string) (string, string, string, error) {
 	file, err := os.Open(path)
@@ -107,7 +221,6 @@ func loadEnvValues(path string) (string, string, string, error) {
 	return urlBase, tokenURL, accessToken, nil
 }
 
-
 func loadCredentials(path string) (string, string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -115,8 +228,7 @@ func loadCredentials(path string) (string, string, error) {
 	}
 	defer file.Close()
 
-	var clientID string
-	var clientSecret string
+	var clientID, clientSecret string
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -153,7 +265,7 @@ func getAccessToken(envPath, tokenURL string) (string, error) {
 	data.Set("grant_type", "client_credentials")
 	data.Set("client_id", clientID)
 	data.Set("client_secret", clientSecret)
-	
+
 	resp, err := http.Post(tokenURL, "application/x-www-form-urlencoded", bytes.NewBufferString(data.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("erro na requisição do token: %w", err)
@@ -181,7 +293,6 @@ func getAccessToken(envPath, tokenURL string) (string, error) {
 	updateEnvToken(envPath, tokenResp.AccessToken)
 	return tokenResp.AccessToken, nil
 }
-
 
 func updateEnvToken(path, token string) {
 	input, err := os.ReadFile(path)
@@ -215,6 +326,11 @@ func doRequestWithRetry(url, token string, attempts int) ([]byte, []ErrorRespons
 	var errors []ErrorResponse
 
 	for attempt := 1; attempt <= attempts; attempt++ {
+
+		/* -------- APLICA RATE LIMIT AQUI -------- */
+		applyRateLimit(url)
+		/* ---------------------------------------- */
+
 		log.Printf("Tentativa %d de %d...", attempt, attempts)
 
 		body, status, err := doSingleRequest(client, url, token)
@@ -233,6 +349,11 @@ func doRequestWithRetry(url, token string, attempts int) ([]byte, []ErrorRespons
 }
 
 func doSingleRequest(client *http.Client, url, token string) ([]byte, int, error) {
+
+	/* -------- APLICA RATE LIMIT EM TODA REQUISIÇÃO -------- */
+	applyRateLimit(url)
+	/* ------------------------------------------------------- */
+
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
