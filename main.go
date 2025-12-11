@@ -12,11 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"apiconsume/utils"
 )
 
 const (
-	maxAttempts    = 5
-	requestTimeout = 30 * time.Second
+	requestTimeout = 60 * time.Second
 )
 
 type ErrorResponse struct {
@@ -40,20 +41,32 @@ func main() {
 	}
 
 	urlRequest := buildURL(urlBase)
-	body, errors, err := doRequestWithRetry(urlRequest, maxAttempts)
 
-	if len(errors) > 0 {
+	rateClient := utils.NewRateLimitClient()
+	var errors []ErrorResponse
+	attempt := 0
+
+	log.Println("Loop infinito iniciado! Apert Ctrl + C para parar.")
+
+	for {
+		attempt++
+		log.Printf("Requisição #%d ...", attempt)
+
+		body, status, err := doSingleRequest(rateClient, urlRequest)
+
+		if err == nil && status == 200 {
+			fmt.Printf("Resposta %d bytes | Status %d\n", len(body), status)
+
+			writeFile(responsePath, body)
+
+			continue
+		}
+
+		msg := fmt.Sprintf("Status %d - %v", status, err)
+		errors = append(errors, ErrorResponse{Attempt: attempt, Error: msg})
+
 		saveErrors(errorLogPath, errors)
 	}
-
-	if err != nil {
-		log.Printf("Falha final na requisição: %v", err)
-		createEmptyResponseFile(responsePath)
-		return
-	}
-
-	writeFile(responsePath, body)
-	log.Println("Arquivo response.json criado com sucesso.")
 }
 
 func loadEnvValues(path string) (string, error) {
@@ -91,29 +104,7 @@ func buildURL(urlBase string) string {
 	return fmt.Sprintf("%s?dataBase=%sT00:00:00.000Z", urlBase, today)
 }
 
-func doRequestWithRetry(url string, attempts int) ([]byte, []ErrorResponse, error) {
-	client := &http.Client{Timeout: requestTimeout}
-	var errors []ErrorResponse
-
-	for attempt := 1; attempt <= attempts; attempt++ {
-		log.Printf("Tentativa %d de %d...", attempt, attempts)
-
-		body, status, err := doSingleRequest(client, url)
-		if err == nil && status == 200 {
-			return body, errors, nil
-		}
-
-		msg := fmt.Sprintf("Status %d - %v", status, err)
-		errors = append(errors, ErrorResponse{Attempt: attempt, Error: msg})
-		log.Println("Erro:", msg)
-
-		time.Sleep(2 * time.Second)
-	}
-
-	return nil, errors, fmt.Errorf("todas as tentativas falharam")
-}
-
-func doSingleRequest(client *http.Client, url string) ([]byte, int, error) {
+func doSingleRequest(rl *utils.RateLimitClient, url string) ([]byte, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
@@ -124,7 +115,7 @@ func doSingleRequest(client *http.Client, url string) ([]byte, int, error) {
 
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	resp, err := client.Do(req)
+	resp, err := rl.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -173,8 +164,4 @@ func saveErrors(path string, errors []ErrorResponse) {
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	encoder.Encode(errors)
-}
-
-func createEmptyResponseFile(path string) {
-	writeFile(path, []byte("[]"))
 }
