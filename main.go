@@ -32,7 +32,7 @@ func main() {
 	}
 
 	envPath := cwd + "/.env"
-	// responsePath := cwd + "/response.json"
+	responsePath := cwd + "/response.json"
 	errorLogPath := cwd + "/errors.json"
 
 	urlBase, err := loadEnvValues(envPath)
@@ -46,33 +46,26 @@ func main() {
 	var errors []ErrorResponse
 	attempt := 0
 
-	log.Println("🔥 Loop infinito iniciado! Apert Ctrl + C para parar.")
+	log.Println("Loop infinito iniciado! Apert Ctrl + C para parar.")
 
 	for {
 		attempt++
-		log.Printf("➡️  Requisição #%d ...", attempt)
+		log.Printf("Requisição #%d ...", attempt)
 
 		body, status, err := doSingleRequest(rateClient, urlRequest)
 
-		// STATUS OK
 		if err == nil && status == 200 {
-			fmt.Printf("✅ Resposta %d bytes | Status %d\n", len(body), status)
+			fmt.Printf("Resposta %d bytes | Status %d\n", len(body), status)
 
-			// opcional: salvar sempre (descomente)
-			// writeFile(responsePath, body)
+			writeFile(responsePath, body)
 
 			continue
 		}
 
-		// ERROS
 		msg := fmt.Sprintf("Status %d - %v", status, err)
 		errors = append(errors, ErrorResponse{Attempt: attempt, Error: msg})
-		log.Println("❌ Erro:", msg)
 
-		// opcional: salvar erros continuamente
 		saveErrors(errorLogPath, errors)
-
-		// continua mesmo após erro, pois o loop é infinito
 	}
 }
 

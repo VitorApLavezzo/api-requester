@@ -4,10 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
+	"strconv"
+	"strings"
 )
 
 type RateLimitClient struct {
@@ -33,6 +33,7 @@ func NewRateLimitClient() *RateLimitClient {
 		MaxRetries:  5,
 		BaseBackoff: 1 * time.Second,
 		DynamicRate: 1,
+		LastRequest: time.Now().Add(-1 * time.Hour),
 	}
 }
 
@@ -45,7 +46,7 @@ func (rl *RateLimitClient) Do(req *http.Request) (*http.Response, error) {
 		if wait < time.Second {
 			wait = time.Second
 		}
-		fmt.Printf("⏳ Esperando reset por header: %v\n", wait)
+		fmt.Printf("Esperando reset por header oficial: %v\n", wait)
 		time.Sleep(wait)
 	}
 
@@ -55,23 +56,28 @@ func (rl *RateLimitClient) Do(req *http.Request) (*http.Response, error) {
 	for attempt := 0; attempt <= rl.MaxRetries; attempt++ {
 
 		resp, err = rl.Client.Do(req)
+
 		if err != nil {
 			return nil, err
 		}
 
 		rl.updateRateLimitTracking(resp)
 
-		// Sucesso
 		if resp.StatusCode != http.StatusTooManyRequests {
 			rl.adjustDynamicRate(false)
+			
+			rl.mu.Lock()
+			rl.LastRequest = time.Now()
+			rl.mu.Unlock()
+			
 			return resp, nil
 		}
 
-		// 429 detectado
-		rl.adjustDynamicRate(true)
+		resp.Body.Close()
+		rl.adjustDynamicRate(true)               
 		wait := rl.getWaitTime(resp, attempt)
 
-		fmt.Printf("⚠️ 429 detectado. Esperando %v...\n", wait)
+		fmt.Printf("429 detectado. Tentativa %d/%d. Esperando %v...\n", attempt+1, rl.MaxRetries, wait)
 		time.Sleep(wait)
 	}
 
@@ -99,7 +105,6 @@ func (rl *RateLimitClient) updateRateLimitTracking(resp *http.Response) {
 	defer rl.mu.Unlock()
 
 	h := resp.Header
-
 	foundHeader := false
 
 	if v := h.Get("X-RateLimit-Limit"); v != "" {
@@ -123,13 +128,11 @@ func (rl *RateLimitClient) updateRateLimitTracking(resp *http.Response) {
 		}
 	}
 
-	// Se a API manda headers → entra em modo fixo
 	if foundHeader {
 		rl.AutoRateMode = false
 		return
 	}
 
-	// Caso contrário → modo de exploração automática
 	if rl.SafeRate == 0 {
 		rl.AutoRateMode = true
 	}
@@ -142,7 +145,6 @@ func (rl *RateLimitClient) getWaitTime(resp *http.Response, attempt int) time.Du
 	h := resp.Header
 
 	if retry := h.Get("Retry-After"); retry != "" {
-
 		if sec, err := strconv.Atoi(strings.TrimSpace(retry)); err == nil {
 			d := time.Duration(sec) * time.Second
 			if d <= 0 {
@@ -150,7 +152,6 @@ func (rl *RateLimitClient) getWaitTime(resp *http.Response, attempt int) time.Du
 			}
 			return d
 		}
-
 		if t, err := http.ParseTime(retry); err == nil {
 			d := time.Until(t)
 			if d <= 0 {
@@ -160,14 +161,8 @@ func (rl *RateLimitClient) getWaitTime(resp *http.Response, attempt int) time.Du
 		}
 	}
 
-	// Se já descobrimos o SafeRate, respeite a janela automática
 	if rl.SafeRate > 0 {
-		return time.Second
-	}
-
-	// Modo automático sem header → espera mínima
-	if rl.AutoRateMode {
-		return rl.BaseBackoff
+		return 1 * time.Second
 	}
 
 	wait := rl.BaseBackoff * time.Duration(1<<attempt)
@@ -181,24 +176,21 @@ func (rl *RateLimitClient) applyDynamicWait() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Se já sabemos o SafeRate → usar ele sempre
+	currentRate := rl.DynamicRate
 	if rl.SafeRate > 0 {
-		minInterval := time.Second / time.Duration(rl.SafeRate)
-		if time.Since(rl.LastRequest) < minInterval {
-			time.Sleep(minInterval - time.Since(rl.LastRequest))
-		}
-		rl.LastRequest = time.Now()
-		return
+		currentRate = rl.SafeRate
 	}
 
-	if !rl.AutoRateMode || rl.DynamicRate <= 0 {
-		return
+	if currentRate <= 0 {
+		currentRate = 1
 	}
 
-	minInterval := time.Second / time.Duration(rl.DynamicRate)
+	minInterval := time.Second / time.Duration(currentRate)
+	elapsed := time.Since(rl.LastRequest)
 
-	if time.Since(rl.LastRequest) < minInterval {
-		time.Sleep(minInterval - time.Since(rl.LastRequest))
+	if elapsed < minInterval {
+		sleepTime := minInterval - elapsed
+		time.Sleep(sleepTime)
 	}
 
 	rl.LastRequest = time.Now()
@@ -207,10 +199,10 @@ func (rl *RateLimitClient) applyDynamicWait() {
 func (rl *RateLimitClient) adjustDynamicRate(hit429 bool) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
+
 	if rl.SafeRate > 0 {
 		rl.DynamicRate = rl.SafeRate
-		rl.AutoRateMode = false 
+		rl.AutoRateMode = false
 		return
 	}
 
@@ -219,19 +211,18 @@ func (rl *RateLimitClient) adjustDynamicRate(hit429 bool) {
 	}
 
 	if hit429 {
-		rl.SafeRate = rl.DynamicRate - 1
-		if rl.SafeRate < 1 {
-			rl.SafeRate = 1
+		newSafe := rl.DynamicRate - 1
+		if newSafe < 1 {
+			newSafe = 1
 		}
 
-		fmt.Println("🔒 Limite seguro detectado:", rl.SafeRate, "req/s")
-
-		rl.DynamicRate = rl.SafeRate
+		rl.SafeRate = newSafe
+		rl.DynamicRate = newSafe
+		fmt.Printf("Limite seguro encontrado e travado em: %d req/s\n", rl.SafeRate)
 		return
 	}
 
 	nextRate := rl.DynamicRate + 1
-
-	fmt.Println("⬆ Aumentando taxa automática para", nextRate, "req/s")
+	fmt.Printf("Aumentando taxa de exploração para %d req/s\n", nextRate)
 	rl.DynamicRate = nextRate
 }
